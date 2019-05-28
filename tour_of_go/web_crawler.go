@@ -3,40 +3,52 @@ package main
 import (
 	"fmt"
 	"sync"
-	"time"
 )
-
 
 type FetchResult struct {
 	body string
 	urls []string
-	err error
+	err  error
+	url  string
 }
 
-var cache = make(map[string]*FetchResult)
-var mutex sync.Mutex
-var threadCount int = 1
-var threadMutex sync.Mutex
+func (fetchResult *FetchResult) String() string {
+	if fetchResult.err != nil {
+		return fmt.Sprint(fetchResult.err)
+	}
+	return fmt.Sprintf("found: %s %q", fetchResult.url, fetchResult.body)
+}
+
+var (
+	cache        = make(map[string]*FetchResult)
+	mutex        sync.Mutex
+	threadCount  = 1
+	threadMutex  sync.Mutex
+	fetchResults = make(chan *FetchResult)
+)
 
 type Fetcher interface {
 	// Fetch returns the body of URL and
 	// a slice of URLs found on that page.
-	Fetch(url string) (body string, urls []string, err error)
+	Fetch(url string) (fetchResult *FetchResult)
 }
 
 func decreaseThreadCount() {
 	threadMutex.Lock()
+	defer threadMutex.Unlock()
 	threadCount--
-	threadMutex.Unlock()
+	if threadCount <= 0 {
+		close(fetchResults)
+	}
 }
 
 func increaseThreadCountBy(threads int) {
 	threadMutex.Lock()
+	defer threadMutex.Unlock()
 	threadCount += threads
-	threadMutex.Unlock()
 }
 
-func getThreadCount() int {
+func ThreadCount() int {
 	return threadCount
 }
 
@@ -47,42 +59,34 @@ func Crawl(url string, depth int, fetcher Fetcher) {
 	if depth <= 0 {
 		return
 	}
+	fetchResult := doFetch(url, fetcher)
+	fetchResults <- fetchResult
+	crawlSubUrls(fetchResult, depth, fetcher)
+}
 
-	var body string
-	var urls []string
-	var err error
-
-	// Don't fetch the same URL twice.
-	mutex.Lock()
-	fetchResult, present := cache[url]
-	mutex.Unlock()
-	if present {
-		body, urls, err = fetchResult.body, fetchResult.urls, fetchResult.err
-	} else {
-		body, urls, err = fetcher.Fetch(url)
-		mutex.Lock()
-		cache[url] = &FetchResult{body, urls, err}
-		mutex.Unlock()
-	}
-
-	if err != nil {
-		fmt.Println(err)
+func crawlSubUrls(fetchResult *FetchResult, depth int, fetcher Fetcher) {
+	if fetchResult.err != nil {
 		return
 	}
-	fmt.Printf("found: %s %q\n", url, body)
-
-	// Fetch URLs in parallel.
-	increaseThreadCountBy(len(urls))
-	for _, u := range urls {
+	increaseThreadCountBy(len(fetchResult.urls))
+	for _, u := range fetchResult.urls {
 		go Crawl(u, depth-1, fetcher)
 	}
-	return
+}
+
+func doFetch(url string, fetcher Fetcher) *FetchResult {
+	mutex.Lock()
+	defer mutex.Unlock()
+	if _, present := cache[url]; !present {
+		cache[url] = fetcher.Fetch(url)
+	}
+	return cache[url]
 }
 
 func main() {
 	go Crawl("https://golang.org/", 4, fetcher)
-	for getThreadCount() > 0 {
-		time.Sleep(50 * time.Millisecond)
+	for fetchResult := range fetchResults {
+		fmt.Println(fetchResult)
 	}
 }
 
@@ -94,11 +98,11 @@ type fakeResult struct {
 	urls []string
 }
 
-func (f fakeFetcher) Fetch(url string) (string, []string, error) {
+func (f fakeFetcher) Fetch(url string) (fetchResult *FetchResult) {
 	if res, ok := f[url]; ok {
-		return res.body, res.urls, nil
+		return &FetchResult{body: res.body, urls: res.urls, url: url}
 	}
-	return "", nil, fmt.Errorf("not found: %s", url)
+	return &FetchResult{err: fmt.Errorf("not found: %s", url), url: url}
 }
 
 // fetcher is a populated fakeFetcher.
